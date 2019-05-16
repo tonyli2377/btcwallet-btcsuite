@@ -174,15 +174,46 @@ type unlockDeriveInfo struct {
 	index       uint32
 }
 
+// SecretKeyGenerator is the function signature of a method that can generate
+// secret keys for the address manager.
+type SecretKeyGenerator func(
+	passphrase *[]byte, config *ScryptOptions) (*snacl.SecretKey, error)
+
 // defaultNewSecretKey returns a new secret key.  See newSecretKey.
-func defaultNewSecretKey(passphrase *[]byte, config *ScryptOptions) (*snacl.SecretKey, error) {
+func defaultNewSecretKey(passphrase *[]byte,
+	config *ScryptOptions) (*snacl.SecretKey, error) {
 	return snacl.NewSecretKey(passphrase, config.N, config.R, config.P)
 }
 
-// newSecretKey is used as a way to replace the new secret key generation
-// function used so tests can provide a version that fails for testing error
-// paths.
-var newSecretKey = defaultNewSecretKey
+var (
+	// secretKeyGen is the inner method that is executed when calling
+	// newSecretKey.
+	secretKeyGen = defaultNewSecretKey
+
+	// secretKeyGenMtx protects access to secretKeyGen, so that it can be
+	// replaced in testing.
+	secretKeyGenMtx sync.RWMutex
+)
+
+// SetSecretKeyGen replaces the existing secret key generator, and returns the
+// previous generator.
+func SetSecretKeyGen(keyGen SecretKeyGenerator) SecretKeyGenerator {
+	secretKeyGenMtx.Lock()
+	oldKeyGen := secretKeyGen
+	secretKeyGen = keyGen
+	secretKeyGenMtx.Unlock()
+
+	return oldKeyGen
+}
+
+// newSecretKey generates a new secret key using the active secretKeyGen.
+func newSecretKey(passphrase *[]byte,
+	config *ScryptOptions) (*snacl.SecretKey, error) {
+
+	secretKeyGenMtx.RLock()
+	defer secretKeyGenMtx.RUnlock()
+	return secretKeyGen(passphrase, config)
+}
 
 // EncryptorDecryptor provides an abstraction on top of snacl.CryptoKey so that
 // our tests can use dependency injection to force the behaviour they need.
@@ -306,6 +337,14 @@ func (m *Manager) WatchOnly() bool {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 
+	return m.watchOnly()
+}
+
+// watchOnly returns true if the root manager is in watch only mode, and false
+// otherwise.
+//
+// NOTE: This method requires the Manager's lock to be held.
+func (m *Manager) watchOnly() bool {
 	return m.watchingOnly
 }
 
@@ -1374,7 +1413,7 @@ func loadManager(ns walletdb.ReadBucket, pubPassphrase []byte,
 	if err != nil {
 		return nil, maybeConvertDbError(err)
 	}
-	startBlock, err := fetchStartBlock(ns)
+	startBlock, err := FetchStartBlock(ns)
 	if err != nil {
 		return nil, maybeConvertDbError(err)
 	}
@@ -1489,14 +1528,6 @@ func Open(ns walletdb.ReadBucket, pubPassphrase []byte,
 	}
 
 	return loadManager(ns, pubPassphrase, chainParams)
-}
-
-// DoUpgrades performs any necessary upgrades to the address manager contained
-// in the wallet database, namespaced by the top level bucket key namespaceKey.
-func DoUpgrades(db walletdb.DB, namespaceKey []byte, pubPassphrase []byte,
-	chainParams *chaincfg.Params, cbs *OpenCallbacks) error {
-
-	return upgradeManager(db, namespaceKey, pubPassphrase, chainParams, cbs)
 }
 
 // createManagerKeyScope creates a new key scoped for a target manager's scope.
@@ -1777,7 +1808,7 @@ func Create(ns walletdb.ReadWriteBucket, seed, pubPassphrase, privPassphrase []b
 	}
 
 	// Save the initial synced to state.
-	err = putSyncedTo(ns, &syncInfo.syncedTo)
+	err = PutSyncedTo(ns, &syncInfo.syncedTo)
 	if err != nil {
 		return maybeConvertDbError(err)
 	}

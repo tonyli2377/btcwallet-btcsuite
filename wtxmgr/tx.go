@@ -140,14 +140,6 @@ type Store struct {
 	NotifyUnspent func(hash *chainhash.Hash, index uint32)
 }
 
-// DoUpgrades performs any necessary upgrades to the transaction history
-// contained in the wallet database, namespaced by the top level bucket key
-// namespaceKey.
-func DoUpgrades(db walletdb.DB, namespaceKey []byte) error {
-	// No upgrades
-	return nil
-}
-
 // Open opens the wallet transaction store from a walletdb namespace.  If the
 // store does not exist, ErrNoExist is returned.
 func Open(ns walletdb.ReadBucket, chainParams *chaincfg.Params) (*Store, error) {
@@ -405,8 +397,14 @@ func (s *Store) AddCredit(ns walletdb.ReadWriteBucket, rec *TxRecord, block *Blo
 // duplicate (false).
 func (s *Store) addCredit(ns walletdb.ReadWriteBucket, rec *TxRecord, block *BlockMeta, index uint32, change bool) (bool, error) {
 	if block == nil {
+		// If the outpoint that we should mark as credit already exists
+		// within the store, either as unconfirmed or confirmed, then we
+		// have nothing left to do and can exit.
 		k := canonicalOutPoint(&rec.Hash, index)
 		if existsRawUnminedCredit(ns, k) != nil {
+			return false, nil
+		}
+		if existsRawUnspent(ns, k) != nil {
 			return false, nil
 		}
 		v := valueUnminedCredit(btcutil.Amount(rec.MsgTx.TxOut[index].Value), change)

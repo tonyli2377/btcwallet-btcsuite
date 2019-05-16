@@ -28,11 +28,12 @@ type NeutrinoClient struct {
 	// We currently support one rescan/notifiction goroutine per client
 	rescan *neutrino.Rescan
 
-	enqueueNotification chan interface{}
-	dequeueNotification chan interface{}
-	startTime           time.Time
-	lastProgressSent    bool
-	currentBlock        chan *waddrmgr.BlockStamp
+	enqueueNotification     chan interface{}
+	dequeueNotification     chan interface{}
+	startTime               time.Time
+	lastProgressSent        bool
+	lastFilteredBlockHeader *wire.BlockHeader
+	currentBlock            chan *waddrmgr.BlockStamp
 
 	quit       chan struct{}
 	rescanQuit chan struct{}
@@ -106,7 +107,7 @@ func (s *NeutrinoClient) GetBlock(hash *chainhash.Hash) (*wire.MsgBlock, error) 
 	// TODO(roasbeef): add a block cache?
 	//  * which evication strategy? depends on use case
 	//  Should the block cache be INSIDE neutrino instead of in btcwallet?
-	block, err := s.CS.GetBlockFromNetwork(*hash)
+	block, err := s.CS.GetBlock(*hash)
 	if err != nil {
 		return nil, err
 	}
@@ -118,16 +119,12 @@ func (s *NeutrinoClient) GetBlock(hash *chainhash.Hash) (*wire.MsgBlock, error) 
 // since we can't actually return a FutureGetBlockVerboseResult because the
 // underlying type is private to rpcclient.
 func (s *NeutrinoClient) GetBlockHeight(hash *chainhash.Hash) (int32, error) {
-	_, height, err := s.CS.BlockHeaders.FetchHeader(hash)
-	if err != nil {
-		return 0, err
-	}
-	return int32(height), nil
+	return s.CS.GetBlockHeight(hash)
 }
 
 // GetBestBlock replicates the RPC client's GetBestBlock command.
 func (s *NeutrinoClient) GetBestBlock() (*chainhash.Hash, int32, error) {
-	chainTip, err := s.CS.BestSnapshot()
+	chainTip, err := s.CS.BestBlock()
 	if err != nil {
 		return nil, 0, err
 	}
@@ -150,20 +147,14 @@ func (s *NeutrinoClient) BlockStamp() (*waddrmgr.BlockStamp, error) {
 // client has been shut down or the hash at the block height doesn't exist or
 // is unknown.
 func (s *NeutrinoClient) GetBlockHash(height int64) (*chainhash.Hash, error) {
-	header, err := s.CS.BlockHeaders.FetchHeaderByHeight(uint32(height))
-	if err != nil {
-		return nil, err
-	}
-	hash := header.BlockHash()
-	return &hash, nil
+	return s.CS.GetBlockHash(height)
 }
 
 // GetBlockHeader returns the block header for the given block hash, or an error
 // if the client has been shut down or the hash doesn't exist or is unknown.
 func (s *NeutrinoClient) GetBlockHeader(
 	blockHash *chainhash.Hash) (*wire.BlockHeader, error) {
-	header, _, err := s.CS.BlockHeaders.FetchHeader(blockHash)
-	return header, err
+	return s.CS.GetBlockHeader(blockHash)
 }
 
 // SendRawTransaction replicates the RPC client's SendRawTransaction command.
@@ -349,11 +340,17 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 	s.scanning = true
 	s.finished = false
 	s.lastProgressSent = false
+	s.lastFilteredBlockHeader = nil
 	s.isRescan = true
 
-	header, height, err := s.CS.BlockHeaders.ChainTip()
+	bestBlock, err := s.CS.BestBlock()
 	if err != nil {
 		return fmt.Errorf("Can't get chain service's best block: %s", err)
+	}
+	header, err := s.CS.GetBlockHeader(&bestBlock.Hash)
+	if err != nil {
+		return fmt.Errorf("Can't get block header for hash %v: %s",
+			bestBlock.Hash, err)
 	}
 
 	// If the wallet is already fully caught up, or the rescan has started
@@ -364,7 +361,7 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		select {
 		case s.enqueueNotification <- &RescanFinished{
 			Hash:   startHash,
-			Height: int32(height),
+			Height: int32(bestBlock.Height),
 			Time:   header.Timestamp,
 		}:
 		case <-s.quit:
@@ -386,7 +383,10 @@ func (s *NeutrinoClient) Rescan(startHash *chainhash.Hash, addrs []btcutil.Addre
 		})
 	}
 
-	newRescan := s.CS.NewRescan(
+	newRescan := neutrino.NewRescan(
+		&neutrino.RescanChainSource{
+			ChainService: s.CS,
+		},
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
 			OnFilteredBlockConnected: s.onFilteredBlockConnected,
@@ -434,9 +434,13 @@ func (s *NeutrinoClient) NotifyReceived(addrs []btcutil.Address) error {
 	// Don't need RescanFinished or RescanProgress notifications.
 	s.finished = true
 	s.lastProgressSent = true
+	s.lastFilteredBlockHeader = nil
 
 	// Rescan with just the specified addresses.
-	newRescan := s.CS.NewRescan(
+	newRescan := neutrino.NewRescan(
+		&neutrino.RescanChainSource{
+			ChainService: s.CS,
+		},
 		neutrino.NotificationHandlers(rpcclient.NotificationHandlers{
 			OnBlockConnected:         s.onBlockConnected,
 			OnFilteredBlockConnected: s.onFilteredBlockConnected,
@@ -494,6 +498,7 @@ func (s *NeutrinoClient) onFilteredBlockConnected(height int32,
 		}
 		ntfn.RelevantTxs = append(ntfn.RelevantTxs, rec)
 	}
+
 	select {
 	case s.enqueueNotification <- ntfn:
 	case <-s.quit:
@@ -502,41 +507,12 @@ func (s *NeutrinoClient) onFilteredBlockConnected(height int32,
 		return
 	}
 
-	// Handle RescanFinished notification if required.
-	bs, err := s.CS.BestSnapshot()
-	if err != nil {
-		log.Errorf("Can't get chain service's best block: %s", err)
-		return
-	}
+	s.clientMtx.Lock()
+	s.lastFilteredBlockHeader = header
+	s.clientMtx.Unlock()
 
-	if bs.Hash == header.BlockHash() {
-		// Only send the RescanFinished notification once.
-		s.clientMtx.Lock()
-		if s.finished {
-			s.clientMtx.Unlock()
-			return
-		}
-		// Only send the RescanFinished notification once the
-		// underlying chain service sees itself as current.
-		current := s.CS.IsCurrent() && s.lastProgressSent
-		if current {
-			s.finished = true
-		}
-		s.clientMtx.Unlock()
-		if current {
-			select {
-			case s.enqueueNotification <- &RescanFinished{
-				Hash:   &bs.Hash,
-				Height: bs.Height,
-				Time:   header.Timestamp,
-			}:
-			case <-s.quit:
-				return
-			case <-s.rescanQuit:
-				return
-			}
-		}
-	}
+	// Handle RescanFinished notification if required.
+	s.dispatchRescanFinished()
 }
 
 // onBlockDisconnected sends appropriate notifications to the notification
@@ -610,6 +586,57 @@ func (s *NeutrinoClient) onBlockConnected(hash *chainhash.Hash, height int32,
 		case <-s.quit:
 		case <-s.rescanQuit:
 		}
+	}
+
+	// Check if we're able to dispatch our final RescanFinished notification
+	// after processing this block.
+	s.dispatchRescanFinished()
+}
+
+// dispatchRescanFinished determines whether we're able to dispatch our final
+// RescanFinished notification in order to mark the wallet as synced with the
+// chain. If the notification has already been dispatched, then it won't be done
+// again.
+func (s *NeutrinoClient) dispatchRescanFinished() {
+	bs, err := s.CS.BestBlock()
+	if err != nil {
+		log.Errorf("Can't get chain service's best block: %s", err)
+		return
+	}
+
+	s.clientMtx.Lock()
+	// Only send the RescanFinished notification once.
+	if s.lastFilteredBlockHeader == nil || s.finished {
+		s.clientMtx.Unlock()
+		return
+	}
+
+	// Only send the RescanFinished notification once the underlying chain
+	// service sees itself as current.
+	if bs.Hash != s.lastFilteredBlockHeader.BlockHash() {
+		s.clientMtx.Unlock()
+		return
+	}
+
+	s.finished = s.CS.IsCurrent() && s.lastProgressSent
+	if !s.finished {
+		s.clientMtx.Unlock()
+		return
+	}
+
+	header := s.lastFilteredBlockHeader
+	s.clientMtx.Unlock()
+
+	select {
+	case s.enqueueNotification <- &RescanFinished{
+		Hash:   &bs.Hash,
+		Height: bs.Height,
+		Time:   header.Timestamp,
+	}:
+	case <-s.quit:
+		return
+	case <-s.rescanQuit:
+		return
 	}
 }
 

@@ -23,8 +23,6 @@ import (
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/davecgh/go-spew/spew"
-
 	"github.com/btcsuite/btcutil"
 	"github.com/btcsuite/btcutil/hdkeychain"
 	"github.com/btcsuite/btcwallet/chain"
@@ -32,7 +30,9 @@ import (
 	"github.com/btcsuite/btcwallet/wallet/txauthor"
 	"github.com/btcsuite/btcwallet/wallet/txrules"
 	"github.com/btcsuite/btcwallet/walletdb"
+	"github.com/btcsuite/btcwallet/walletdb/migration"
 	"github.com/btcsuite/btcwallet/wtxmgr"
+	"github.com/davecgh/go-spew/spew"
 )
 
 const (
@@ -173,6 +173,8 @@ func (w *Wallet) SynchronizeRPC(chainClient chain.Interface) {
 	switch cc := chainClient.(type) {
 	case *chain.NeutrinoClient:
 		cc.SetStartTime(w.Manager.Birthday())
+	case *chain.BitcoindClient:
+		cc.SetBirthday(w.Manager.Birthday())
 	}
 	w.chainClientLock.Unlock()
 
@@ -316,261 +318,49 @@ func (w *Wallet) activeData(dbtx walletdb.ReadTx) ([]btcutil.Address, []wtxmgr.C
 }
 
 // syncWithChain brings the wallet up to date with the current chain server
-// connection.  It creates a rescan request and blocks until the rescan has
-// finished.
-//
-func (w *Wallet) syncWithChain() error {
+// connection. It creates a rescan request and blocks until the rescan has
+// finished. The birthday block can be passed in, if set, to ensure we can
+// properly detect if it gets rolled back.
+func (w *Wallet) syncWithChain(birthdayStamp *waddrmgr.BlockStamp) error {
+	// To start, if we've yet to find our birthday stamp, we'll do so now.
+	if birthdayStamp == nil {
+		var err error
+		birthdayStamp, err = w.syncToBirthday()
+		if err != nil {
+			return err
+		}
+	}
+
+	// If the wallet requested an on-chain recovery of its funds, we'll do
+	// so now.
+	if w.recoveryWindow > 0 {
+		// We'll start the recovery from our birthday unless we were
+		// in the middle of a previous recovery attempt. If that's the
+		// case, we'll resume from that point.
+		startHeight := birthdayStamp.Height
+		walletHeight := w.Manager.SyncedTo().Height
+		if walletHeight > startHeight {
+			startHeight = walletHeight
+		}
+		if err := w.recovery(startHeight); err != nil {
+			return err
+		}
+	}
+
+	// Compare previously-seen blocks against the current chain. If any of
+	// these blocks no longer exist, rollback all of the missing blocks
+	// before catching up with the rescan.
+	rollback := false
+	rollbackStamp := w.Manager.SyncedTo()
 	chainClient, err := w.requireChainClient()
 	if err != nil {
 		return err
 	}
 
-	// Request notifications for transactions sending to all wallet
-	// addresses.
-	var (
-		addrs   []btcutil.Address
-		unspent []wtxmgr.Credit
-	)
-	err = walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
-		var err error
-		addrs, unspent, err = w.activeData(dbtx)
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
-	startHeight := w.Manager.SyncedTo().Height
-
-	isRecovery := w.recoveryWindow > 0
-	isInitialSync := len(addrs) == 0 && len(unspent) == 0 &&
-		startHeight == 0
-
-	// TODO(jrick): How should this handle a synced height earlier than
-	// the chain server best block?
-
-	// When no addresses have been generated for the wallet, the rescan can
-	// be skipped.
-	//
-	// TODO: This is only correct because activeData above returns all
-	// addresses ever created, including those that don't need to be watched
-	// anymore.  This code should be updated when this assumption is no
-	// longer true, but worst case would result in an unnecessary rescan.
-	if isInitialSync || isRecovery {
-		// Find the latest checkpoint's height. This lets us catch up to
-		// at least that checkpoint, since we're synchronizing from
-		// scratch, and lets us avoid a bunch of costly DB transactions
-		// in the case when we're using BDB for the walletdb backend and
-		// Neutrino for the chain.Interface backend, and the chain
-		// backend starts synchronizing at the same time as the wallet.
-		_, bestHeight, err := chainClient.GetBestBlock()
-		if err != nil {
-			return err
-		}
-
-		checkHeight := bestHeight
-		if len(w.chainParams.Checkpoints) > 0 {
-			checkHeight = w.chainParams.Checkpoints[len(
-				w.chainParams.Checkpoints)-1].Height
-		}
-
-		logHeight := checkHeight
-		if bestHeight > logHeight {
-			logHeight = bestHeight
-		}
-
-		log.Infof("Catching up block hashes to height %d, this will "+
-			"take a while...", logHeight)
-
-		// Initialize the first database transaction.
-		tx, err := w.db.BeginReadWriteTx()
-		if err != nil {
-			return err
-		}
-		ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
-
-		// Only allocate the recoveryMgr if we are actually in recovery
-		// mode.
-		var recoveryMgr *RecoveryManager
-		if isRecovery {
-			log.Infof("RECOVERY MODE ENABLED -- rescanning for "+
-				"used addresses with recovery_window=%d",
-				w.recoveryWindow)
-
-			// Initialize the recovery manager with a default batch
-			// size of 2000.
-			recoveryMgr = NewRecoveryManager(
-				w.recoveryWindow, recoveryBatchSize,
-				w.chainParams,
-			)
-
-			// In the event that this recovery is being resumed, we
-			// will need to repopulate all found addresses from the
-			// database. For basic recovery, we will only do so for
-			// the default scopes.
-			scopedMgrs, err := w.defaultScopeManagers()
-			if err != nil {
-				return err
-			}
-
-			txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-			credits, err := w.TxStore.UnspentOutputs(txmgrNs)
-			if err != nil {
-				return err
-			}
-
-			err = recoveryMgr.Resurrect(ns, scopedMgrs, credits)
-			if err != nil {
-				return err
-			}
-		}
-
-		for height := startHeight; height <= bestHeight; height++ {
-			hash, err := chainClient.GetBlockHash(int64(height))
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-
-			// If we've found the best height the backend knows
-			// about, but we haven't reached the last checkpoint, we
-			// know the backend is still synchronizing. We can give
-			// it a little bit of time to synchronize further before
-			// updating the best height based on the backend. Once
-			// we see that the backend has advanced, we can catch
-			// up to it.
-			for height == bestHeight && bestHeight < checkHeight {
-				time.Sleep(100 * time.Millisecond)
-				_, bestHeight, err = chainClient.GetBestBlock()
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-
-				// If we're using the Neutrino backend, we can
-				// check if it's current or not. If it's not and
-				// we've exceeded the original checkHeight, we
-				// can keep the loop going by increasing the
-				// checkHeight to be greater than the bestHeight
-				// and if it is, we can set checkHeight to the
-				// same as the bestHeight so the loop exits.
-				switch c := chainClient.(type) {
-				case *chain.NeutrinoClient:
-					if c.CS.IsCurrent() {
-						checkHeight = bestHeight
-					} else if checkHeight < bestHeight+1 {
-						checkHeight = bestHeight + 1
-					}
-				}
-			}
-
-			header, err := chainClient.GetBlockHeader(hash)
-			if err != nil {
-				return err
-			}
-
-			// Check to see if this header's timestamp has surpassed
-			// our birthday. If we are in recovery mode and the
-			// check passes, we will add this block to our list of
-			// blocks to scan for recovered addresses.
-			timestamp := header.Timestamp
-			if isRecovery && timestamp.After(w.Manager.Birthday()) {
-				recoveryMgr.AddToBlockBatch(
-					hash, height, timestamp,
-				)
-			}
-
-			err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
-				Hash:      *hash,
-				Height:    height,
-				Timestamp: timestamp,
-			})
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-
-			// If we are in recovery mode, attempt a recovery on
-			// blocks that have been added to the recovery manager's
-			// block batch thus far. If block batch is empty, this
-			// will be a NOP.
-			if isRecovery && height%recoveryBatchSize == 0 {
-				err := w.recoverDefaultScopes(
-					chainClient, tx, ns,
-					recoveryMgr.BlockBatch(),
-					recoveryMgr.State(),
-				)
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-
-				// Clear the batch of all processed blocks.
-				recoveryMgr.ResetBlockBatch()
-			}
-
-			// Every 10K blocks, commit and start a new database TX.
-			if height%10000 == 0 {
-				err = tx.Commit()
-				if err != nil {
-					tx.Rollback()
-					return err
-				}
-
-				log.Infof("Caught up to height %d", height)
-
-				tx, err = w.db.BeginReadWriteTx()
-				if err != nil {
-					return err
-				}
-
-				ns = tx.ReadWriteBucket(waddrmgrNamespaceKey)
-			}
-		}
-
-		// Perform one last recovery attempt for all blocks that were
-		// not batched at the default granularity of 2000 blocks.
-		if isRecovery {
-			err := w.recoverDefaultScopes(
-				chainClient, tx, ns, recoveryMgr.BlockBatch(),
-				recoveryMgr.State(),
-			)
-			if err != nil {
-				tx.Rollback()
-				return err
-			}
-		}
-
-		// Commit (or roll back) the final database transaction.
-		err = tx.Commit()
-		if err != nil {
-			tx.Rollback()
-			return err
-		}
-		log.Info("Done catching up block hashes")
-
-		// Since we've spent some time catching up block hashes, we
-		// might have new addresses waiting for us that were requested
-		// during initial sync. Make sure we have those before we
-		// request a rescan later on.
-		err = walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
-			var err error
-			addrs, unspent, err = w.activeData(dbtx)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-	}
-
-	// Compare previously-seen blocks against the chain server.  If any of
-	// these blocks no longer exist, rollback all of the missing blocks
-	// before catching up with the rescan.
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		rollback := false
-		rollbackStamp := w.Manager.SyncedTo()
+
 		for height := rollbackStamp.Height; true; height-- {
 			hash, err := w.Manager.BlockHash(addrmgrNs, height)
 			if err != nil {
@@ -594,20 +384,37 @@ func (w *Wallet) syncWithChain() error {
 			}
 			rollback = true
 		}
-		if rollback {
-			err := w.Manager.SetSyncedTo(addrmgrNs, &rollbackStamp)
-			if err != nil {
-				return err
-			}
-			// Rollback unconfirms transactions at and beyond the passed
-			// height, so add one to the new synced-to height to prevent
-			// unconfirming txs from the synced-to block.
-			err = w.TxStore.Rollback(txmgrNs, rollbackStamp.Height+1)
+
+		// If a rollback did not happen, we can proceed safely.
+		if !rollback {
+			return nil
+		}
+
+		// Otherwise, we'll mark this as our new synced height.
+		err := w.Manager.SetSyncedTo(addrmgrNs, &rollbackStamp)
+		if err != nil {
+			return err
+		}
+
+		// If the rollback happened to go beyond our birthday stamp,
+		// we'll need to find a new one by syncing with the chain again
+		// until finding one.
+		if rollbackStamp.Height <= birthdayStamp.Height &&
+			rollbackStamp.Hash != birthdayStamp.Hash {
+
+			err := w.Manager.SetBirthdayBlock(
+				addrmgrNs, rollbackStamp, true,
+			)
 			if err != nil {
 				return err
 			}
 		}
-		return nil
+
+		// Finally, we'll roll back our transaction store to reflect the
+		// stale state. `Rollback` unconfirms transactions at and beyond
+		// the passed height, so add one to the new synced-to height to
+		// prevent unconfirming transactions in the synced-to block.
+		return w.TxStore.Rollback(txmgrNs, rollbackStamp.Height+1)
 	})
 	if err != nil {
 		return err
@@ -621,12 +428,347 @@ func (w *Wallet) syncWithChain() error {
 	// as well.  I am leaning towards allowing off all rpcclient
 	// notification re-registrations, in which case the code here should be
 	// left as is.
-	err = chainClient.NotifyBlocks()
+	if err := chainClient.NotifyBlocks(); err != nil {
+		return err
+	}
+
+	// Finally, we'll trigger a wallet rescan from the currently synced tip
+	// and request notifications for transactions sending to all wallet
+	// addresses and spending all wallet UTXOs.
+	var (
+		addrs   []btcutil.Address
+		unspent []wtxmgr.Credit
+	)
+	err = walletdb.View(w.db, func(dbtx walletdb.ReadTx) error {
+		addrs, unspent, err = w.activeData(dbtx)
+		return err
+	})
 	if err != nil {
 		return err
 	}
 
-	return w.Rescan(addrs, unspent)
+	return w.rescanWithTarget(addrs, unspent, nil)
+}
+
+// isDevEnv determines whether the wallet is currently under a local developer
+// environment, e.g. simnet or regtest.
+func (w *Wallet) isDevEnv() bool {
+	switch uint32(w.ChainParams().Net) {
+	case uint32(chaincfg.RegressionNetParams.Net):
+	case uint32(chaincfg.SimNetParams.Net):
+	default:
+		return false
+	}
+	return true
+}
+
+// scanChain is a helper method that scans the chain from the starting height
+// until the tip of the chain. The onBlock callback can be used to perform
+// certain operations for every block that we process as we scan the chain.
+func (w *Wallet) scanChain(startHeight int32,
+	onBlock func(int32, *chainhash.Hash, *wire.BlockHeader) error) error {
+
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return err
+	}
+
+	// isCurrent is a helper function that we'll use to determine if the
+	// chain backend is currently synced. When running with a btcd or
+	// bitcoind backend, it will use the height of the latest checkpoint as
+	// its lower bound.
+	var latestCheckptHeight int32
+	if len(w.chainParams.Checkpoints) > 0 {
+		latestCheckptHeight = w.chainParams.
+			Checkpoints[len(w.chainParams.Checkpoints)-1].Height
+	}
+	isCurrent := func(bestHeight int32) bool {
+		// If the best height is zero, we assume the chain backend is
+		// still looking for peers to sync to in the case of a global
+		// network, e.g., testnet and mainnet.
+		if bestHeight == 0 && !w.isDevEnv() {
+			return false
+		}
+
+		switch c := chainClient.(type) {
+		case *chain.NeutrinoClient:
+			return c.CS.IsCurrent()
+		}
+		return bestHeight >= latestCheckptHeight
+	}
+
+	// Determine the latest height known to the chain backend and begin
+	// scanning the chain from the start height up until this point.
+	_, bestHeight, err := chainClient.GetBestBlock()
+	if err != nil {
+		return err
+	}
+
+	for height := startHeight; height <= bestHeight; height++ {
+		hash, err := chainClient.GetBlockHash(int64(height))
+		if err != nil {
+			return err
+		}
+		header, err := chainClient.GetBlockHeader(hash)
+		if err != nil {
+			return err
+		}
+
+		if err := onBlock(height, hash, header); err != nil {
+			return err
+		}
+
+		// If we've reached our best height, we'll wait for blocks at
+		// tip to ensure we go through all existent blocks in the chain.
+		// We'll update our bestHeight before checking if we're current
+		// with the chain to ensure we process any additional blocks
+		// that came in while we were scanning from our starting point.
+		for height == bestHeight {
+			time.Sleep(100 * time.Millisecond)
+			_, bestHeight, err = chainClient.GetBestBlock()
+			if err != nil {
+				return err
+			}
+			if isCurrent(bestHeight) {
+				break
+			}
+		}
+	}
+
+	return nil
+}
+
+// syncToBirthday attempts to sync the wallet's point of view of the chain until
+// it finds the first block whose timestamp is above the wallet's birthday. The
+// wallet's birthday is already two days in the past of its actual birthday, so
+// this is relatively safe to do.
+func (w *Wallet) syncToBirthday() (*waddrmgr.BlockStamp, error) {
+	var birthdayStamp *waddrmgr.BlockStamp
+	birthday := w.Manager.Birthday()
+
+	tx, err := w.db.BeginReadWriteTx()
+	if err != nil {
+		return nil, err
+	}
+	ns := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+
+	// We'll begin scanning the chain from our last sync point until finding
+	// the first block with a timestamp greater than our birthday. We'll use
+	// this block to represent our birthday stamp. errDone is an error we'll
+	// use to signal that we've found it and no longer need to keep scanning
+	// the chain.
+	errDone := errors.New("done")
+	err = w.scanChain(w.Manager.SyncedTo().Height, func(height int32,
+		hash *chainhash.Hash, header *wire.BlockHeader) error {
+
+		if header.Timestamp.After(birthday) {
+			log.Debugf("Found birthday block: height=%d, hash=%v",
+				height, hash)
+
+			birthdayStamp = &waddrmgr.BlockStamp{
+				Hash:      *hash,
+				Height:    height,
+				Timestamp: header.Timestamp,
+			}
+
+			err := w.Manager.SetBirthdayBlock(
+				ns, *birthdayStamp, true,
+			)
+			if err != nil {
+				return err
+			}
+		}
+
+		err = w.Manager.SetSyncedTo(ns, &waddrmgr.BlockStamp{
+			Hash:      *hash,
+			Height:    height,
+			Timestamp: header.Timestamp,
+		})
+		if err != nil {
+			return err
+		}
+
+		// Checkpoint our state every 10K blocks.
+		if height%10000 == 0 {
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+
+			log.Infof("Caught up to height %d", height)
+
+			tx, err = w.db.BeginReadWriteTx()
+			if err != nil {
+				return err
+			}
+			ns = tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		}
+
+		// If we've found our birthday, we can return errDone to signal
+		// that we should stop scanning the chain and persist our state.
+		if birthdayStamp != nil {
+			return errDone
+		}
+
+		return nil
+	})
+	if err != nil && err != errDone {
+		tx.Rollback()
+		return nil, err
+	}
+
+	// If a birthday stamp has yet to be found, we'll return an error
+	// indicating so, but only if this is a live chain like it is the case
+	// with testnet and mainnet.
+	if birthdayStamp == nil && !w.isDevEnv() {
+		tx.Rollback()
+		return nil, fmt.Errorf("did not find a suitable birthday "+
+			"block with a timestamp greater than %v", birthday)
+	}
+
+	// Otherwise, if we're in a development environment and we've yet to
+	// find a birthday block due to the chain not being current, we'll
+	// use the last block we've synced to as our birthday to proceed.
+	if birthdayStamp == nil {
+		syncedTo := w.Manager.SyncedTo()
+		err := w.Manager.SetBirthdayBlock(ns, syncedTo, true)
+		if err != nil {
+			return nil, err
+		}
+		birthdayStamp = &syncedTo
+	}
+
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	return birthdayStamp, nil
+}
+
+// recovery attempts to recover any unspent outputs that pay to any of our
+// addresses starting from the specified height.
+//
+// NOTE: The starting height must be at least the height of the wallet's
+// birthday or later.
+func (w *Wallet) recovery(startHeight int32) error {
+	log.Infof("RECOVERY MODE ENABLED -- rescanning for used addresses "+
+		"with recovery_window=%d", w.recoveryWindow)
+
+	// We'll initialize the recovery manager with a default batch size of
+	// 2000.
+	recoveryMgr := NewRecoveryManager(
+		w.recoveryWindow, recoveryBatchSize, w.chainParams,
+	)
+
+	// In the event that this recovery is being resumed, we will need to
+	// repopulate all found addresses from the database. For basic recovery,
+	// we will only do so for the default scopes.
+	scopedMgrs, err := w.defaultScopeManagers()
+	if err != nil {
+		return err
+	}
+	tx, err := w.db.BeginReadWriteTx()
+	if err != nil {
+		return err
+	}
+	txMgrNS := tx.ReadBucket(wtxmgrNamespaceKey)
+	credits, err := w.TxStore.UnspentOutputs(txMgrNS)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	addrMgrNS := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+	err = recoveryMgr.Resurrect(addrMgrNS, scopedMgrs, credits)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// We'll also retrieve our chain backend client in order to filter the
+	// blocks as we go.
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// We'll begin scanning the chain from the specified starting height.
+	// Since we assume that the lowest height we start with will at least be
+	// that of our birthday, we can just add every block we process from
+	// this point forward to the recovery batch.
+	err = w.scanChain(startHeight, func(height int32,
+		hash *chainhash.Hash, header *wire.BlockHeader) error {
+
+		recoveryMgr.AddToBlockBatch(hash, height, header.Timestamp)
+
+		// We'll checkpoint our current batch every 2K blocks, so we'll
+		// need to start a new database transaction. If our current
+		// batch is empty, then this will act as a NOP.
+		if height%recoveryBatchSize == 0 {
+			blockBatch := recoveryMgr.BlockBatch()
+			err := w.recoverDefaultScopes(
+				chainClient, tx, addrMgrNS, blockBatch,
+				recoveryMgr.State(),
+			)
+			if err != nil {
+				return err
+			}
+
+			// Clear the batch of all processed blocks.
+			recoveryMgr.ResetBlockBatch()
+
+			if err := tx.Commit(); err != nil {
+				return err
+			}
+
+			log.Infof("Recovered addresses from blocks %d-%d",
+				blockBatch[0].Height,
+				blockBatch[len(blockBatch)-1].Height)
+
+			tx, err = w.db.BeginReadWriteTx()
+			if err != nil {
+				return err
+			}
+			addrMgrNS = tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		}
+
+		// Since the recovery in a way acts as a rescan, we'll update
+		// the wallet's tip to point to the current block so that we
+		// don't unnecessarily rescan the same block again later on.
+		return w.Manager.SetSyncedTo(addrMgrNS, &waddrmgr.BlockStamp{
+			Hash:      *hash,
+			Height:    height,
+			Timestamp: header.Timestamp,
+		})
+	})
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// Now that we've reached the chain tip, we can process our final batch
+	// with the remaining blocks if it did not reach its maximum size.
+	blockBatch := recoveryMgr.BlockBatch()
+	err = w.recoverDefaultScopes(
+		chainClient, tx, addrMgrNS, blockBatch, recoveryMgr.State(),
+	)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	// With the recovery complete, we can persist our new state and exit.
+	if err := tx.Commit(); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	if len(blockBatch) > 0 {
+		log.Infof("Recovered addresses from blocks %d-%d", blockBatch[0].Height,
+			blockBatch[len(blockBatch)-1].Height)
+	}
+
+	return nil
 }
 
 // defaultScopeManagers fetches the ScopedKeyManagers from the wallet using the
@@ -1039,6 +1181,7 @@ type (
 		outputs     []*wire.TxOut
 		minconf     int32
 		feeSatPerKB btcutil.Amount
+		dryRun      bool
 		resp        chan createTxResponse
 	}
 	createTxResponse struct {
@@ -1069,7 +1212,7 @@ out:
 				continue
 			}
 			tx, err := w.txToOutputs(txr.outputs, txr.account,
-				txr.minconf, txr.feeSatPerKB)
+				txr.minconf, txr.feeSatPerKB, txr.dryRun)
 			heldUnlock.release()
 			txr.resp <- createTxResponse{tx, err}
 		case <-quit:
@@ -1080,19 +1223,24 @@ out:
 }
 
 // CreateSimpleTx creates a new signed transaction spending unspent P2PKH
-// outputs with at laest minconf confirmations spending to any number of
+// outputs with at least minconf confirmations spending to any number of
 // address/amount pairs.  Change and an appropriate transaction fee are
 // automatically included, if necessary.  All transaction creation through this
 // function is serialized to prevent the creation of many transactions which
 // spend the same outputs.
+//
+// NOTE: The dryRun argument can be set true to create a tx that doesn't alter
+// the database. A tx created with this set to true SHOULD NOT be broadcasted.
 func (w *Wallet) CreateSimpleTx(account uint32, outputs []*wire.TxOut,
-	minconf int32, satPerKb btcutil.Amount) (*txauthor.AuthoredTx, error) {
+	minconf int32, satPerKb btcutil.Amount, dryRun bool) (
+	*txauthor.AuthoredTx, error) {
 
 	req := createTxRequest{
 		account:     account,
 		outputs:     outputs,
 		minconf:     minconf,
 		feeSatPerKB: satPerKb,
+		dryRun:      dryRun,
 		resp:        make(chan createTxResponse),
 	}
 	w.createTxRequests <- req
@@ -1434,33 +1582,62 @@ func (w *Wallet) CalculateAccountBalances(account uint32, confirms int32) (Balan
 // been used (there is at least one transaction spending to it in the
 // blockchain or btcd mempool), the next chained address is returned.
 func (w *Wallet) CurrentAddress(account uint32, scope waddrmgr.KeyScope) (btcutil.Address, error) {
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+
 	manager, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
 		return nil, err
 	}
 
-	var addr btcutil.Address
+	var (
+		addr  btcutil.Address
+		props *waddrmgr.AccountProperties
+	)
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		maddr, err := manager.LastExternalAddress(addrmgrNs, account)
 		if err != nil {
-			// If no address exists yet, create the first external address
+			// If no address exists yet, create the first external
+			// address.
 			if waddrmgr.IsError(err, waddrmgr.ErrAddressNotFound) {
-				addr, err = w.newAddress(addrmgrNs, account, scope)
+				addr, props, err = w.newAddress(
+					addrmgrNs, account, scope,
+				)
 			}
 			return err
 		}
 
-		// Get next chained address if the last one has already been used.
+		// Get next chained address if the last one has already been
+		// used.
 		if maddr.Used(addrmgrNs) {
-			addr, err = w.newAddress(addrmgrNs, account, scope)
+			addr, props, err = w.newAddress(
+				addrmgrNs, account, scope,
+			)
 			return err
 		}
 
 		addr = maddr.Address()
 		return nil
 	})
-	return addr, err
+	if err != nil {
+		return nil, err
+	}
+
+	// If the props have been initially, then we had to create a new address
+	// to satisfy the query. Notify the rpc server about the new address.
+	if props != nil {
+		err = chainClient.NotifyReceived([]btcutil.Address{addr})
+		if err != nil {
+			return nil, err
+		}
+
+		w.NtfnServer.notifyAccountProperties(props)
+	}
+
+	return addr, nil
 }
 
 // PubKeyForAddress looks up the associated public key for a P2PKH address.
@@ -2538,6 +2715,9 @@ func (w *Wallet) DumpWIFPrivateKey(addr btcutil.Address) (string, error) {
 
 // ImportPrivateKey imports a private key to the wallet and writes the new
 // wallet to disk.
+//
+// NOTE: If a block stamp is not provided, then the wallet's birthday will be
+// set to the genesis block of the corresponding chain.
 func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 	bs *waddrmgr.BlockStamp, rescan bool) (string, error) {
 
@@ -2548,18 +2728,18 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 
 	// The starting block for the key is the genesis block unless otherwise
 	// specified.
-	var newBirthday time.Time
 	if bs == nil {
 		bs = &waddrmgr.BlockStamp{
-			Hash:   *w.chainParams.GenesisHash,
-			Height: 0,
+			Hash:      *w.chainParams.GenesisHash,
+			Height:    0,
+			Timestamp: w.chainParams.GenesisBlock.Header.Timestamp,
 		}
-	} else {
+	} else if bs.Timestamp.IsZero() {
 		// Only update the new birthday time from default value if we
 		// actually have timestamp info in the header.
 		header, err := w.chainClient.GetBlockHeader(&bs.Hash)
 		if err == nil {
-			newBirthday = header.Timestamp
+			bs.Timestamp = header.Timestamp
 		}
 	}
 
@@ -2579,7 +2759,28 @@ func (w *Wallet) ImportPrivateKey(scope waddrmgr.KeyScope, wif *btcutil.WIF,
 		if err != nil {
 			return err
 		}
-		return w.Manager.SetBirthday(addrmgrNs, newBirthday)
+
+		// We'll only update our birthday with the new one if it is
+		// before our current one. Otherwise, if we do, we can
+		// potentially miss detecting relevant chain events that
+		// occurred between them while rescanning.
+		birthdayBlock, _, err := w.Manager.BirthdayBlock(addrmgrNs)
+		if err != nil {
+			return err
+		}
+		if bs.Height >= birthdayBlock.Height {
+			return nil
+		}
+
+		err = w.Manager.SetBirthday(addrmgrNs, bs.Timestamp)
+		if err != nil {
+			return err
+		}
+
+		// To ensure this birthday block is correct, we'll mark it as
+		// unverified to prompt a sanity check at the next restart to
+		// ensure it is correct as it was provided by the caller.
+		return w.Manager.SetBirthdayBlock(addrmgrNs, *bs, false)
 	})
 	if err != nil {
 		return "", err
@@ -2661,82 +2862,29 @@ func (w *Wallet) LockedOutpoints() []btcjson.TransactionInput {
 // credits that are not known to have been mined into a block, and attempts
 // to send each to the chain server for relay.
 func (w *Wallet) resendUnminedTxs() {
-	chainClient, err := w.requireChainClient()
-	if err != nil {
-		log.Errorf("No chain server available to resend unmined transactions")
-		return
-	}
-
 	var txs []*wire.MsgTx
-	err = walletdb.View(w.db, func(tx walletdb.ReadTx) error {
+	err := walletdb.View(w.db, func(tx walletdb.ReadTx) error {
 		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
 		var err error
 		txs, err = w.TxStore.UnminedTxs(txmgrNs)
 		return err
 	})
 	if err != nil {
-		log.Errorf("Cannot load unmined transactions for resending: %v", err)
+		log.Errorf("Unable to retrieve unconfirmed transactions to "+
+			"resend: %v", err)
 		return
 	}
 
 	for _, tx := range txs {
-		resp, err := chainClient.SendRawTransaction(tx, false)
+		txHash, err := w.publishTransaction(tx)
 		if err != nil {
-			log.Debugf("Could not resend transaction %v: %v",
+			log.Debugf("Unable to rebroadcast transaction %v: %v",
 				tx.TxHash(), err)
-
-			// We'll only stop broadcasting transactions if we
-			// detect that the output has already been fully spent,
-			// is an orphan, or is conflicting with another
-			// transaction.
-			//
-			// TODO(roasbeef): SendRawTransaction needs to return
-			// concrete error types, no need for string matching
-			switch {
-			// The following are errors returned from btcd's
-			// mempool.
-			case strings.Contains(err.Error(), "spent"):
-			case strings.Contains(err.Error(), "orphan"):
-			case strings.Contains(err.Error(), "conflict"):
-
-			// The following errors are returned from bitcoind's
-			// mempool.
-			case strings.Contains(err.Error(), "Missing inputs"):
-			case strings.Contains(err.Error(), "already in block chain"):
-			case strings.Contains(err.Error(), "fee not met"):
-
-			default:
-				continue
-			}
-
-			// As the transaction was rejected, we'll attempt to
-			// remove the unmined transaction all together.
-			// Otherwise, we'll keep attempting to rebroadcast
-			// this, and we may be computing our balance
-			// incorrectly if this tx credits or debits to us.
-			err := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
-				txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
-
-				txRec, err := wtxmgr.NewTxRecordFromMsgTx(
-					tx, time.Now(),
-				)
-				if err != nil {
-					return err
-				}
-
-				return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
-			})
-			if err != nil {
-				log.Warnf("unable to remove conflicting "+
-					"tx %v: %v", tx.TxHash(), err)
-				continue
-			}
-
-			log.Infof("Removed conflicting tx: %v", spew.Sdump(tx))
-
 			continue
 		}
-		log.Debugf("Resent unmined transaction %v", resp)
+
+		log.Debugf("Successfully rebroadcast unconfirmed transaction %v",
+			txHash)
 	}
 }
 
@@ -2761,69 +2909,99 @@ func (w *Wallet) SortedActivePaymentAddresses() ([]string, error) {
 
 // NewAddress returns the next external chained address for a wallet.
 func (w *Wallet) NewAddress(account uint32,
-	scope waddrmgr.KeyScope) (addr btcutil.Address, err error) {
+	scope waddrmgr.KeyScope) (btcutil.Address, error) {
 
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		addr  btcutil.Address
+		props *waddrmgr.AccountProperties
+	)
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		var err error
-		addr, err = w.newAddress(addrmgrNs, account, scope)
+		addr, props, err = w.newAddress(addrmgrNs, account, scope)
 		return err
 	})
-	return
+	if err != nil {
+		return nil, err
+	}
+
+	// Notify the rpc server about the newly created address.
+	err = chainClient.NotifyReceived([]btcutil.Address{addr})
+	if err != nil {
+		return nil, err
+	}
+
+	w.NtfnServer.notifyAccountProperties(props)
+
+	return addr, nil
 }
 
 func (w *Wallet) newAddress(addrmgrNs walletdb.ReadWriteBucket, account uint32,
-	scope waddrmgr.KeyScope) (btcutil.Address, error) {
+	scope waddrmgr.KeyScope) (btcutil.Address, *waddrmgr.AccountProperties, error) {
 
 	manager, err := w.Manager.FetchScopedKeyManager(scope)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// Get next address from wallet.
 	addrs, err := manager.NextExternalAddresses(addrmgrNs, account, 1)
 	if err != nil {
-		return nil, err
-	}
-
-	// Request updates from btcd for new transactions sent to this address.
-	utilAddrs := make([]btcutil.Address, len(addrs))
-	for i, addr := range addrs {
-		utilAddrs[i] = addr.Address()
-	}
-	w.chainClientLock.Lock()
-	chainClient := w.chainClient
-	w.chainClientLock.Unlock()
-	if chainClient != nil {
-		err := chainClient.NotifyReceived(utilAddrs)
-		if err != nil {
-			return nil, err
-		}
+		return nil, nil, err
 	}
 
 	props, err := manager.AccountProperties(addrmgrNs, account)
 	if err != nil {
 		log.Errorf("Cannot fetch account properties for notification "+
 			"after deriving next external address: %v", err)
-	} else {
-		w.NtfnServer.notifyAccountProperties(props)
+		return nil, nil, err
 	}
 
-	return utilAddrs[0], nil
+	return addrs[0].Address(), props, nil
 }
 
 // NewChangeAddress returns a new change address for a wallet.
-func (w *Wallet) NewChangeAddress(account uint32, scope waddrmgr.KeyScope) (addr btcutil.Address, err error) {
+func (w *Wallet) NewChangeAddress(account uint32,
+	scope waddrmgr.KeyScope) (btcutil.Address, error) {
+
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+
+	var addr btcutil.Address
 	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
 		addrmgrNs := tx.ReadWriteBucket(waddrmgrNamespaceKey)
 		var err error
 		addr, err = w.newChangeAddress(addrmgrNs, account)
 		return err
 	})
-	return
+	if err != nil {
+		return nil, err
+	}
+
+	// Notify the rpc server about the newly created address.
+	err = chainClient.NotifyReceived([]btcutil.Address{addr})
+	if err != nil {
+		return nil, err
+	}
+
+	return addr, nil
 }
 
-func (w *Wallet) newChangeAddress(addrmgrNs walletdb.ReadWriteBucket, account uint32) (btcutil.Address, error) {
+// newChangeAddress returns a new change address for the wallet.
+//
+// NOTE: This method requires the caller to use the backend's NotifyReceived
+// method in order to detect when an on-chain transaction pays to the address
+// being created.
+func (w *Wallet) newChangeAddress(addrmgrNs walletdb.ReadWriteBucket,
+	account uint32) (btcutil.Address, error) {
+
 	// As we're making a change address, we'll fetch the type of manager
 	// that is able to make p2wkh output as they're the most efficient.
 	scopes := w.Manager.ScopesForExternalAddrType(
@@ -2840,21 +3018,7 @@ func (w *Wallet) newChangeAddress(addrmgrNs walletdb.ReadWriteBucket, account ui
 		return nil, err
 	}
 
-	// Request updates from btcd for new transactions sent to this address.
-	utilAddrs := make([]btcutil.Address, len(addrs))
-	for i, addr := range addrs {
-		utilAddrs[i] = addr.Address()
-	}
-
-	chainClient, err := w.requireChainClient()
-	if err == nil {
-		err = chainClient.NotifyReceived(utilAddrs)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return utilAddrs[0], nil
+	return addrs[0].Address(), nil
 }
 
 // confirmed checks whether a transaction at height txHeight has met minconf
@@ -3001,59 +3165,40 @@ func (w *Wallet) TotalReceivedForAddr(addr btcutil.Address, minConf int32) (btcu
 }
 
 // SendOutputs creates and sends payment transactions. It returns the
-// transaction hash upon success.
+// transaction upon success.
 func (w *Wallet) SendOutputs(outputs []*wire.TxOut, account uint32,
-	minconf int32, satPerKb btcutil.Amount) (*chainhash.Hash, error) {
+	minconf int32, satPerKb btcutil.Amount) (*wire.MsgTx, error) {
 
-	chainClient, err := w.requireChainClient()
-	if err != nil {
-		return nil, err
-	}
-
+	// Ensure the outputs to be created adhere to the network's consensus
+	// rules.
 	for _, output := range outputs {
-		err = txrules.CheckOutput(output, satPerKb)
-		if err != nil {
+		if err := txrules.CheckOutput(output, satPerKb); err != nil {
 			return nil, err
 		}
 	}
 
-	// Create transaction, replying with an error if the creation
-	// was not successful.
-	createdTx, err := w.CreateSimpleTx(account, outputs, minconf, satPerKb)
+	// Create the transaction and broadcast it to the network. The
+	// transaction will be added to the database in order to ensure that we
+	// continue to re-broadcast the transaction upon restarts until it has
+	// been confirmed.
+	createdTx, err := w.CreateSimpleTx(
+		account, outputs, minconf, satPerKb, false,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create transaction record and insert into the db.
-	rec, err := wtxmgr.NewTxRecordFromMsgTx(createdTx.Tx, time.Now())
-	if err != nil {
-		log.Errorf("Cannot create record for created transaction: %v", err)
-		return nil, err
-	}
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		err := w.TxStore.InsertTx(txmgrNs, rec, nil)
-		if err != nil {
-			return err
-		}
-
-		if createdTx.ChangeIndex >= 0 {
-			err = w.TxStore.AddCredit(txmgrNs, rec, nil, uint32(createdTx.ChangeIndex), true)
-			if err != nil {
-				log.Errorf("Error adding change address for sent "+
-					"tx: %v", err)
-				return err
-			}
-		}
-		return nil
-	})
+	txHash, err := w.reliablyPublishTransaction(createdTx.Tx)
 	if err != nil {
 		return nil, err
 	}
 
-	// TODO: The record already has the serialized tx, so no need to
-	// serialize it again.
-	return chainClient.SendRawTransaction(&rec.MsgTx, false)
+	// Sanity check on the returned tx hash.
+	if *txHash != createdTx.Tx.TxHash() {
+		return nil, errors.New("tx hash mismatch")
+	}
+
+	return createdTx.Tx, nil
 }
 
 // SignatureError records the underlying error when validating a transaction
@@ -3199,9 +3344,19 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx, hashType txscript.SigHashType,
 // This function is unstable and will be removed once syncing code is moved out
 // of the wallet.
 func (w *Wallet) PublishTransaction(tx *wire.MsgTx) error {
-	server, err := w.requireChainClient()
+	_, err := w.reliablyPublishTransaction(tx)
+	return err
+}
+
+// reliablyPublishTransaction is a superset of publishTransaction which contains
+// the primary logic required for publishing a transaction, updating the
+// relevant database state, and finally possible removing the transaction from
+// the database (along with cleaning up all inputs used, and outputs created) if
+// the transaction is rejected by the backend.
+func (w *Wallet) reliablyPublishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
+	chainClient, err := w.requireChainClient()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// As we aim for this to be general reliable transaction broadcast API,
@@ -3210,63 +3365,129 @@ func (w *Wallet) PublishTransaction(tx *wire.MsgTx) error {
 	// set of records.
 	txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-		txmgrNs := tx.ReadWriteBucket(wtxmgrNamespaceKey)
-		return w.TxStore.InsertTx(txmgrNs, txRec, nil)
+	err = walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
+		return w.addRelevantTx(dbTx, txRec, nil)
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	_, err = server.SendRawTransaction(tx, false)
-	switch {
-	case err == nil:
-		switch w.chainClient.(type) {
-		// For neutrino we need to trigger adding relevant tx manually
-		// because for spv client - tx data isn't received from sync peer.
-		case *chain.NeutrinoClient:
-			return walletdb.Update(w.db, func(tx walletdb.ReadWriteTx) error {
-				return w.addRelevantTx(tx, txRec, nil)
-			})
+	// We'll also ask to be notified of the transaction once it confirms
+	// on-chain. This is done outside of the database transaction to prevent
+	// backend interaction within it.
+	//
+	// NOTE: In some cases, it's possible that the transaction to be
+	// broadcast is not directly relevant to the user's wallet, e.g.,
+	// multisig. In either case, we'll still ask to be notified of when it
+	// confirms to maintain consistency.
+	//
+	// TODO(wilmer): import script as external if the address does not
+	// belong to the wallet to handle confs during restarts?
+	for _, txOut := range tx.TxOut {
+		_, addrs, _, err := txscript.ExtractPkScriptAddrs(
+			txOut.PkScript, w.chainParams,
+		)
+		if err != nil {
+			// Non-standard outputs can safely be skipped because
+			// they're not supported by the wallet.
+			continue
 		}
 
-		return nil
+		if err := chainClient.NotifyReceived(addrs); err != nil {
+			return nil, err
+		}
+	}
 
-	// The following are errors returned from btcd's mempool.
-	case strings.Contains(err.Error(), "spent"):
-		fallthrough
-	case strings.Contains(err.Error(), "orphan"):
-		fallthrough
-	case strings.Contains(err.Error(), "conflict"):
+	return w.publishTransaction(tx)
+}
+
+// publishTransaction attempts to send an unconfirmed transaction to the
+// wallet's current backend. In the event that sending the transaction fails for
+// whatever reason, it will be removed from the wallet's unconfirmed transaction
+// store.
+func (w *Wallet) publishTransaction(tx *wire.MsgTx) (*chainhash.Hash, error) {
+	chainClient, err := w.requireChainClient()
+	if err != nil {
+		return nil, err
+	}
+
+	txid, err := chainClient.SendRawTransaction(tx, false)
+	switch {
+	case err == nil:
+		return txid, nil
+
+	// Since we have different backends that can be used with the wallet,
+	// we'll need to check specific errors for each one.
+	//
+	// If the transaction is already in the mempool, we can just return now.
+	//
+	// This error is returned when broadcasting/sending a transaction to a
+	// btcd node that already has it in their mempool.
+	case strings.Contains(err.Error(), "already have transaction"):
 		fallthrough
 
-	// The following errors are returned from bitcoind's mempool.
-	case strings.Contains(err.Error(), "fee not met"):
-		fallthrough
-	case strings.Contains(err.Error(), "Missing inputs"):
-		fallthrough
-	case strings.Contains(err.Error(), "already in block chain"):
+	// This error is returned when broadcasting a transaction to a bitcoind
+	// node that already has it in their mempool.
+	case strings.Contains(err.Error(), "txn-already-in-mempool"):
+		return txid, nil
 
-		// If the transaction was rejected, then we'll remove it from
-		// the txstore, as otherwise, we'll attempt to continually
-		// re-broadcast it, and the utxo state of the wallet won't be
-		// accurate.
+	// If the transaction has already confirmed, we can safely remove it
+	// from the unconfirmed store as it should already exist within the
+	// confirmed store. We'll avoid returning an error as the broadcast was
+	// in a sense successful.
+	//
+	// This error is returned when broadcasting/sending a transaction that
+	// has already confirmed to a btcd node.
+	case strings.Contains(err.Error(), "transaction already exists"):
+		fallthrough
+
+	// This error is returned when broadcasting a transaction that has
+	// already confirmed to a bitcoind node.
+	case strings.Contains(err.Error(), "txn-already-known"):
+		fallthrough
+
+	// This error is returned when sending a transaction that has already
+	// confirmed to a bitcoind node over RPC.
+	case strings.Contains(err.Error(), "transaction already in block chain"):
 		dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
 			txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
-
+			txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+			if err != nil {
+				return err
+			}
 			return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
 		})
 		if dbErr != nil {
-			return fmt.Errorf("unable to broadcast tx: %v, "+
-				"unable to remove invalid tx: %v", err, dbErr)
+			log.Warnf("Unable to remove confirmed transaction %v "+
+				"from unconfirmed store: %v", tx.TxHash(), dbErr)
 		}
 
-		return err
+		return txid, nil
 
+	// If the transaction was rejected for whatever other reason, then we'll
+	// remove it from the transaction store, as otherwise, we'll attempt to
+	// continually re-broadcast it, and the UTXO state of the wallet won't
+	// be accurate.
 	default:
-		return err
+		dbErr := walletdb.Update(w.db, func(dbTx walletdb.ReadWriteTx) error {
+			txmgrNs := dbTx.ReadWriteBucket(wtxmgrNamespaceKey)
+			txRec, err := wtxmgr.NewTxRecordFromMsgTx(tx, time.Now())
+			if err != nil {
+				return err
+			}
+			return w.TxStore.RemoveUnminedTx(txmgrNs, txRec)
+		})
+		if dbErr != nil {
+			log.Warnf("Unable to remove invalid transaction %v: %v",
+				tx.TxHash(), dbErr)
+		} else {
+			log.Infof("Removed invalid transaction: %v",
+				spew.Sdump(tx))
+		}
+
+		return nil, err
 	}
 }
 
@@ -3330,58 +3551,49 @@ func Create(db walletdb.DB, pubPass, privPass, seed []byte, params *chaincfg.Par
 func Open(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 	params *chaincfg.Params, recoveryWindow uint32) (*Wallet, error) {
 
-	err := walletdb.View(db, func(tx walletdb.ReadTx) error {
-		waddrmgrBucket := tx.ReadBucket(waddrmgrNamespaceKey)
-		if waddrmgrBucket == nil {
+	var (
+		addrMgr *waddrmgr.Manager
+		txMgr   *wtxmgr.Store
+	)
+
+	// Before attempting to open the wallet, we'll check if there are any
+	// database upgrades for us to proceed. We'll also create our references
+	// to the address and transaction managers, as they are backed by the
+	// database.
+	err := walletdb.Update(db, func(tx walletdb.ReadWriteTx) error {
+		addrMgrBucket := tx.ReadWriteBucket(waddrmgrNamespaceKey)
+		if addrMgrBucket == nil {
 			return errors.New("missing address manager namespace")
 		}
-		wtxmgrBucket := tx.ReadBucket(wtxmgrNamespaceKey)
-		if wtxmgrBucket == nil {
+		txMgrBucket := tx.ReadWriteBucket(wtxmgrNamespaceKey)
+		if txMgrBucket == nil {
 			return errors.New("missing transaction manager namespace")
 		}
+
+		addrMgrUpgrader := waddrmgr.NewMigrationManager(addrMgrBucket)
+		txMgrUpgrader := wtxmgr.NewMigrationManager(txMgrBucket)
+		err := migration.Upgrade(txMgrUpgrader, addrMgrUpgrader)
+		if err != nil {
+			return err
+		}
+
+		addrMgr, err = waddrmgr.Open(addrMgrBucket, pubPass, params)
+		if err != nil {
+			return err
+		}
+		txMgr, err = wtxmgr.Open(txMgrBucket, params)
+		if err != nil {
+			return err
+		}
+
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Perform upgrades as necessary.  Each upgrade is done under its own
-	// transaction, which is managed by each package itself, so the entire
-	// DB is passed instead of passing already opened write transaction.
-	//
-	// This will need to change later when upgrades in one package depend on
-	// data in another (such as removing chain synchronization from address
-	// manager).
-	err = waddrmgr.DoUpgrades(db, waddrmgrNamespaceKey, pubPass, params, cbs)
-	if err != nil {
-		return nil, err
-	}
-	err = wtxmgr.DoUpgrades(db, wtxmgrNamespaceKey)
-	if err != nil {
-		return nil, err
-	}
-
-	// Open database abstraction instances
-	var (
-		addrMgr *waddrmgr.Manager
-		txMgr   *wtxmgr.Store
-	)
-	err = walletdb.View(db, func(tx walletdb.ReadTx) error {
-		addrmgrNs := tx.ReadBucket(waddrmgrNamespaceKey)
-		txmgrNs := tx.ReadBucket(wtxmgrNamespaceKey)
-		var err error
-		addrMgr, err = waddrmgr.Open(addrmgrNs, pubPass, params)
-		if err != nil {
-			return err
-		}
-		txMgr, err = wtxmgr.Open(txmgrNs, params)
-		return err
-	})
-	if err != nil {
-		return nil, err
-	}
-
 	log.Infof("Opened wallet") // TODO: log balance? last sync height?
+
 	w := &Wallet{
 		publicPassphrase:    pubPass,
 		db:                  db,
@@ -3404,9 +3616,11 @@ func Open(db walletdb.DB, pubPass []byte, cbs *waddrmgr.OpenCallbacks,
 		chainParams:         params,
 		quit:                make(chan struct{}),
 	}
+
 	w.NtfnServer = newNotificationServer(w)
 	w.TxStore.NotifyUnspent = func(hash *chainhash.Hash, index uint32) {
 		w.NtfnServer.notifyUnspentOutput(0, hash, index)
 	}
+
 	return w, nil
 }
